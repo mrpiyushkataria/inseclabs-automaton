@@ -1,0 +1,168 @@
+version: '3.8'
+
+services:
+  # MariaDB Database
+  db:
+    image: mariadb:10.11
+    container_name: inseclabs-db
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: inseclabs_automaton
+      MYSQL_USER: automaton
+      MYSQL_PASSWORD: automaton_password
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "3306:3306"
+    networks:
+      - inseclabs-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # Redis for Caching and Queues
+  redis:
+    image: redis:7-alpine
+    container_name: inseclabs-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - inseclabs-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  # Backend API
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: inseclabs-backend
+    environment:
+      DATABASE_URL: mysql+pymysql://automaton:automaton_password@db/inseclabs_automaton
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
+      ENVIRONMENT: production
+      TOOLS_PATH: /opt/inseclabs/tools
+      ARTIFACTS_PATH: /opt/inseclabs/artifacts
+    ports:
+      - "8000:8000"
+    volumes:
+      - tools_data:/opt/inseclabs/tools
+      - artifacts_data:/opt/inseclabs/artifacts
+      - ./config:/app/config
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - inseclabs-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend (Nginx)
+  frontend:
+    image: nginx:alpine
+    container_name: inseclabs-frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./frontend/dist:/usr/share/nginx/html
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - backend
+    networks:
+      - inseclabs-network
+    restart: unless-stopped
+
+  # Worker for background tasks
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    container_name: inseclabs-worker
+    environment:
+      DATABASE_URL: mysql+pymysql://automaton:automaton_password@db/inseclabs_automaton
+      REDIS_URL: redis://redis:6379/0
+      WORKER_NAME: worker-1
+      MAX_CONCURRENT_TASKS: 5
+    volumes:
+      - tools_data:/opt/inseclabs/tools
+      - artifacts_data:/opt/inseclabs/artifacts
+    depends_on:
+      - db
+      - redis
+    networks:
+      - inseclabs-network
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+  # Tool Installer Service
+  tool-installer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.tools
+    container_name: inseclabs-tool-installer
+    environment:
+      DATABASE_URL: mysql+pymysql://automaton:automaton_password@db/inseclabs_automaton
+      TOOLS_PATH: /opt/inseclabs/tools
+    volumes:
+      - tools_data:/opt/inseclabs/tools
+      - ./config/tools.yaml:/app/config/tools.yaml
+    depends_on:
+      - db
+    networks:
+      - inseclabs-network
+    restart: on-failure
+    command: ["python", "scripts/install_tools.py"]
+
+  # Monitoring (Prometheus + Grafana)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: inseclabs-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - inseclabs-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: inseclabs-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/dashboards:/etc/grafana/provisioning/dashboards
+    networks:
+      - inseclabs-network
+    restart: unless-stopped
+
+networks:
+  inseclabs-network:
+    driver: bridge
+
+volumes:
+  db_data:
+  redis_data:
+  tools_data:
+  artifacts_data:
+  prometheus_data:
+  grafana_data:
